@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
 use log::{debug, error, warn};
-use quinn::congestion::{Bbr, Controller};
+use quinn::congestion::{Bbr, BbrConfig, Controller};
 use rand::distr::Alphanumeric;
 use rand::{Rng, RngCore};
 use rustc_hash::FxHashMap;
@@ -1000,7 +1000,8 @@ pub async fn start_hysteria2_server(
                 // Enable GSO (Generic Segmentation Offload) for better throughput
                 .enable_segmentation_offload(true)
                 // Lower initial RTT estimate for faster initial window growth
-                .initial_rtt(Duration::from_millis(100));
+                .initial_rtt(Duration::from_millis(100))
+                .congestion_controller_factory(|| Box::new(Bbr::new(Arc::new(BbrConfig::default()), 1200)) as Box<dyn Controller>);
 
             // Use 7.5MB socket buffers for high-throughput QUIC (8.625MB on BSD for 15% kernel overhead)
             // https://github.com/quic-go/quic-go/wiki/UDP-Buffer-Sizes
@@ -1013,11 +1014,8 @@ pub async fn start_hysteria2_server(
             )
             .unwrap();
 
-            let mut endpoint_config = quinn::EndpointConfig::default();
-            endpoint_config.congestion_controller_factory(|| Box::new(Bbr::default()) as Box<dyn Controller>);
-
             let endpoint = quinn::Endpoint::new(
-                endpoint_config,
+                quinn::EndpointConfig::default(),
                 Some(server_config),
                 socket2_socket.into(),
                 Arc::new(quinn::TokioRuntime),
