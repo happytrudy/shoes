@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
 use log::{debug, error, warn};
+use quinn::congestion::{Bbr, Controller};
 use rand::distr::Alphanumeric;
 use rand::{Rng, RngCore};
 use rustc_hash::FxHashMap;
@@ -1012,8 +1013,11 @@ pub async fn start_hysteria2_server(
             )
             .unwrap();
 
+            let mut endpoint_config = quinn::EndpointConfig::default();
+            endpoint_config.congestion_controller_factory(|| Box::new(Bbr::default()) as Box<dyn Controller>);
+
             let endpoint = quinn::Endpoint::new(
-                quinn::EndpointConfig::default(),
+                endpoint_config,
                 Some(server_config),
                 socket2_socket.into(),
                 Arc::new(quinn::TokioRuntime),
