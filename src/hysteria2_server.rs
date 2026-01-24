@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
 use log::{debug, error, warn};
-use quinn::congestion::{Bbr, BbrConfig, BbrControllerFactory, Controller};
+use quinn::congestion::{Bbr, BbrConfig, Controller, ControllerFactory};
 use rand::distr::Alphanumeric;
 use rand::{Rng, RngCore};
 use rustc_hash::FxHashMap;
@@ -39,6 +39,16 @@ use crate::resolver::{Resolver, ResolverCache};
 use crate::stream_reader::StreamReader;
 use crate::tcp::tcp_server::setup_client_tcp_stream;
 use crate::util::allocate_vec;
+
+struct BbrFactory {
+    config: Arc<BbrConfig>,
+}
+
+impl ControllerFactory for BbrFactory {
+    fn new_controller(&self, transport_config: &quinn::TransportConfig) -> Box<dyn Controller> {
+        Box::new(Bbr::new(self.config.clone(), transport_config.initial_mtu))
+    }
+}
 
 async fn process_connection(
     client_proxy_selector: Arc<ClientProxySelector>,
@@ -1001,7 +1011,7 @@ pub async fn start_hysteria2_server(
                 .enable_segmentation_offload(true)
                 // Lower initial RTT estimate for faster initial window growth
                 .initial_rtt(Duration::from_millis(100))
-                .congestion_controller_factory(Arc::new(BbrControllerFactory::new(Arc::new(BbrConfig::default()))));
+                .congestion_controller_factory(Arc::new(BbrFactory { config: Arc::new(BbrConfig::default()) }));
 
             // Use 7.5MB socket buffers for high-throughput QUIC (8.625MB on BSD for 15% kernel overhead)
             // https://github.com/quic-go/quic-go/wiki/UDP-Buffer-Sizes
