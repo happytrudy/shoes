@@ -65,7 +65,9 @@ async fn process_connection(
     // to replay attacks, though for incoming server connections it's 0.5-RTT which
     // is safer but still shouldn't be used for client-authenticated data).
     let connection = if zero_rtt_handshake {
-        let connecting = conn.accept().map_err(std::io::Error::other)?;
+        let connecting = conn
+            .accept()
+            .map_err(|e| std::io::Error::other(format!("QUIC accept failed: {e}")))?;
         // For incoming connections, into_0rtt() always succeeds per quinn docs
         let (connection, _zero_rtt_accepted) = connecting
             .into_0rtt()
@@ -695,7 +697,7 @@ async fn run_udp_remote_to_local_stream_loop(
             let count = send_stream
                 .write(&buf[i..end_offset])
                 .await
-                .map_err(std::io::Error::other)?;
+                .map_err(|e| std::io::Error::other(format!("TUIC stream write failed: {e}")))?;
             i += count;
         }
     }
@@ -1398,15 +1400,30 @@ pub async fn start_tuic_server(
     resolver: Arc<dyn Resolver>,
     num_endpoints: usize,
     zero_rtt_handshake: bool,
+    congestion_control: crate::config::CongestionControl,
 ) -> std::io::Result<Vec<JoinHandle<()>>> {
     let mut join_handles = vec![];
     for _ in 0..num_endpoints {
         let quic_server_config = quic_server_config.clone();
         let resolver = resolver.clone();
         let client_proxy_selector = client_proxy_selector.clone();
+        let congestion_control = congestion_control.clone();
 
         let join_handle = tokio::spawn(async move {
             let mut server_config = quinn::ServerConfig::with_crypto(quic_server_config);
+
+            // Apply Brutal congestion controller if configured
+            if let crate::config::CongestionControl::Brutal(ref brutal_cfg) = congestion_control {
+                let bps = crate::congestion_control::parse_bandwidth_bps(&brutal_cfg.bandwidth)
+                    .expect("failed to parse brutal bandwidth");
+                let brutal_config = crate::congestion_control::BrutalConfig::new(bps)
+                    .with_cwnd_gain(brutal_cfg.cwnd_gain)
+                    .with_min_window(brutal_cfg.min_window)
+                    .with_ack_compensate(brutal_cfg.ack_compensate);
+                Arc::get_mut(&mut server_config.transport)
+                    .expect("failed to get mut ref to transport config")
+                    .congestion_controller_factory(std::sync::Arc::new(brutal_config));
+            }
 
             Arc::get_mut(&mut server_config.transport)
                 .unwrap()

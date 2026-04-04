@@ -24,3 +24,22 @@
   protocol:
     type: hysteria2
     password: supersecret
+
+# Hysteria2 with Brutal congestion control (recommended for high-loss networks)
+# Set bandwidth to your server's actual upload speed
+- address: "[::]:443"
+  transport: quic
+  quic_settings:
+    cert: cert.pem
+    key: key.pem
+    alpn_protocols:
+      - h3
+    congestion_control: brutal
+    bandwidth: "100m"          # 100 Mbps upload speed
+    cwnd_gain: 1.25            # BDP multiplier (default)
+    min_window: 16384          # Min cwnd in bytes (default)
+    ack_compensate: false       # ACK rate compensation (default)
+  protocol:
+    type: hysteria2
+    password: supersecret
+    udp_enabled: true

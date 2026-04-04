@@ -300,6 +300,7 @@ pub async fn start_quic_servers(
         alpn_protocols,
         client_fingerprints,
         num_endpoints,
+        congestion_control,
     } = quic_settings.unwrap();
 
     // Certificates are already embedded as PEM data during config validation
@@ -319,8 +320,9 @@ pub async fn start_quic_servers(
         &client_fingerprints.into_vec(),
     ));
 
-    let quic_server_config: quinn::crypto::rustls::QuicServerConfig =
-        server_config.try_into().map_err(std::io::Error::other)?;
+    let quic_server_config: quinn::crypto::rustls::QuicServerConfig = server_config
+        .try_into()
+        .map_err(|e| std::io::Error::other(format!("invalid QUIC server config: {e}")))?;
 
     let quic_server_config = Arc::new(quic_server_config);
 
@@ -351,6 +353,7 @@ pub async fn start_quic_servers(
                     resolver,
                     num_endpoints,
                     udp_enabled,
+                    congestion_control.clone(),
                 )
                 .await?;
                 handles.extend(hysteria2_handles);
@@ -376,6 +379,7 @@ pub async fn start_quic_servers(
                     resolver,
                     num_endpoints,
                     zero_rtt_handshake,
+                    congestion_control.clone(),
                 )
                 .await?;
                 handles.extend(tuic_handles);

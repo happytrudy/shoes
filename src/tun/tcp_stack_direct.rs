@@ -255,9 +255,13 @@ impl DirectDevice {
     }
 
     /// Try to read a packet (non-blocking) using pooled buffer.
-    fn try_recv(&mut self) -> Option<PooledBuffer> {
+    /// Returns:
+    /// - Ok(Some(packet)) if a packet was read
+    /// - Ok(None) if no packet was available (WouldBlock)
+    /// - Err(e) if a fatal error occurred (including EOF)
+    fn try_recv(&mut self) -> io::Result<Option<PooledBuffer>> {
         if let Some(pkt) = self.pending_rx.take() {
-            return Some(pkt);
+            return Ok(Some(pkt));
         }
 
         // Get a buffer from the pool
@@ -267,9 +271,23 @@ impl DirectDevice {
         match read_nonblocking(self.fd, &mut buffer) {
             Ok(n) if n > 0 => {
                 buffer.truncate(n);
-                Some(buffer)
+                Ok(Some(buffer))
             }
-            _ => None, // Buffer is returned to pool when dropped
+            Ok(_) => {
+                // n == 0 means EOF
+                Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "TUN device closed (EOF)",
+                ))
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                // Buffer is returned to pool when dropped
+                Ok(None)
+            }
+            Err(e) => {
+                // Fatal error
+                Err(e)
+            }
         }
     }
 
@@ -415,6 +433,9 @@ fn run_direct_stack_thread(
 
     let stack_thread = thread::current();
 
+    let mut phy_wait_error_count: u32 = 0;
+    const MAX_PHY_WAIT_ERRORS: u32 = 10;
+
     info!("smoltcp direct stack thread started, entering main loop");
 
     while running.load(Ordering::Relaxed) {
@@ -435,8 +456,14 @@ fn run_direct_stack_thread(
 
         while packets_read < MAX_PACKET_BATCH {
             let pkt = match device.try_recv() {
-                Some(p) => p,
-                None => break,
+                Ok(Some(p)) => p,
+                Ok(None) => break,
+                Err(e) => {
+                    // Critical error reading from TUN (EOF or EIO)
+                    error!("TUN device read failed: {}. Stack thread stopping.", e);
+                    running.store(false, Ordering::Relaxed);
+                    break;
+                }
             };
             packets_read += 1;
 
@@ -512,6 +539,15 @@ fn run_direct_stack_thread(
                     }
                 }
             }
+        }
+
+        if packets_read > 0 {
+            phy_wait_error_count = 0;
+        }
+
+        // Skip remaining work if a fatal read error was detected above.
+        if !running.load(Ordering::Relaxed) {
+            break;
         }
 
         // Processes batched TCP/ICMP packets through smoltcp.
@@ -676,10 +712,26 @@ fn run_direct_stack_thread(
                 SmolDuration::from_millis(millis)
             });
 
+            // phy_wait calls select() on the TUN fd to sleep until data
+            // arrives. If the fd becomes invalid (e.g. device removed),
+            // select() returns EBADF immediately with no sleep, creating a
+            // hot spin loop. The try_recv path usually catches this first,
+            // but this counter acts as a backstop: after 10 consecutive
+            // non-EINTR errors with no successful reads in between, treat
+            // the fd as dead.
             if let Err(e) = phy_wait(fd, wait_duration)
                 && e.kind() != io::ErrorKind::Interrupted
             {
-                warn!("select() error: {}", e);
+                phy_wait_error_count += 1;
+                if phy_wait_error_count >= MAX_PHY_WAIT_ERRORS {
+                    error!(
+                        "select() failed {} consecutive times (last: {}). Stack thread stopping.",
+                        phy_wait_error_count, e
+                    );
+                    running.store(false, Ordering::Relaxed);
+                } else {
+                    warn!("select() error ({}): {}", phy_wait_error_count, e);
+                }
             }
         }
     }
@@ -891,15 +943,12 @@ fn set_nonblocking(fd: RawFd) -> io::Result<()> {
 }
 
 /// Non-blocking read from a file descriptor (fd must already be non-blocking).
+/// Returns Err(WouldBlock) when no data is available, so callers can
+/// distinguish it from Ok(0) which indicates EOF.
 fn read_nonblocking(fd: RawFd, buf: &mut [u8]) -> io::Result<usize> {
     let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
     if n < 0 {
-        let err = io::Error::last_os_error();
-        if err.kind() == io::ErrorKind::WouldBlock {
-            Ok(0)
-        } else {
-            Err(err)
-        }
+        Err(io::Error::last_os_error())
     } else {
         Ok(n as usize)
     }
@@ -918,8 +967,9 @@ fn write_all(fd: RawFd, buf: &[u8]) -> io::Result<()> {
         };
         if n < 0 {
             let err = io::Error::last_os_error();
-            if err.raw_os_error() == Some(libc::ENOBUFS) {
-                trace!("TUN write ENOBUFS, packet dropped");
+            if err.raw_os_error() == Some(libc::ENOBUFS) || err.kind() == io::ErrorKind::WouldBlock
+            {
+                trace!("TUN write {}, packet dropped", err);
                 return Ok(());
             }
             return Err(err);
@@ -927,4 +977,129 @@ fn write_all(fd: RawFd, buf: &[u8]) -> io::Result<()> {
         written += n as usize;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::io::IntoRawFd;
+    use std::os::unix::net::UnixStream;
+
+    #[test]
+    fn test_stack_shutdown_on_eof() {
+        let (server, client) = UnixStream::pair().expect("Failed to create socket pair");
+        let client_fd = client.into_raw_fd();
+
+        let stack = TcpStackDirect::new(client_fd, 1500);
+
+        thread::sleep(Duration::from_millis(100));
+        assert!(stack.is_running(), "Stack thread should be running");
+
+        // Closing the writer end triggers EOF on the reader.
+        drop(server);
+
+        let start = std::time::Instant::now();
+        let timeout = Duration::from_secs(2);
+
+        while stack.is_running() {
+            if start.elapsed() > timeout {
+                panic!("Stack thread did not exit after EOF on FD");
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    #[test]
+    fn test_stack_shutdown_on_closed_fd() {
+        let (server, client) = UnixStream::pair().expect("Failed to create socket pair");
+        let client_fd = client.into_raw_fd();
+
+        let stack = TcpStackDirect::new(client_fd, 1500);
+
+        thread::sleep(Duration::from_millis(100));
+        assert!(stack.is_running(), "Stack thread should be running");
+
+        // Externally close the fd to produce EBADF on both read and select.
+        unsafe { libc::close(client_fd) };
+        // Also drop the writer so there's no other holder.
+        drop(server);
+
+        let start = std::time::Instant::now();
+        let timeout = Duration::from_secs(5);
+
+        while stack.is_running() {
+            if start.elapsed() > timeout {
+                panic!("Stack thread did not exit after closed FD");
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    #[test]
+    fn test_stack_exits_promptly() {
+        // Verifies the stack exits within 1 second of EOF, catching
+        // regressions that would cause CPU spin on a dead fd.
+        let (server, client) = UnixStream::pair().expect("Failed to create socket pair");
+        let client_fd = client.into_raw_fd();
+
+        let stack = TcpStackDirect::new(client_fd, 1500);
+
+        thread::sleep(Duration::from_millis(100));
+        assert!(stack.is_running());
+
+        drop(server);
+
+        let start = std::time::Instant::now();
+        let timeout = Duration::from_secs(1);
+
+        while stack.is_running() {
+            if start.elapsed() > timeout {
+                panic!("Stack thread took >1s to exit after EOF (possible spin)");
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn test_write_all_eagain() {
+        // Fill a non-blocking socket's write buffer, then verify write_all
+        // treats EAGAIN the same as ENOBUFS (drops the packet, returns Ok).
+        let (reader, writer) = UnixStream::pair().expect("Failed to create socket pair");
+        let writer_fd = writer.into_raw_fd();
+
+        set_nonblocking(writer_fd).expect("set_nonblocking");
+
+        // Fill the write buffer until WouldBlock
+        let big_buf = vec![0u8; 65536];
+        loop {
+            let n = unsafe {
+                libc::write(
+                    writer_fd,
+                    big_buf.as_ptr() as *const libc::c_void,
+                    big_buf.len(),
+                )
+            };
+            if n < 0 {
+                let err = io::Error::last_os_error();
+                assert_eq!(
+                    err.kind(),
+                    io::ErrorKind::WouldBlock,
+                    "unexpected error: {}",
+                    err
+                );
+                break;
+            }
+        }
+
+        // Now write_all should drop the packet gracefully
+        let result = write_all(writer_fd, &[1, 2, 3]);
+        assert!(
+            result.is_ok(),
+            "write_all should return Ok on EAGAIN, got {:?}",
+            result
+        );
+
+        unsafe { libc::close(writer_fd) };
+        drop(reader);
+    }
 }

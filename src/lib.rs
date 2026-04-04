@@ -61,6 +61,7 @@ mod async_stream;
 mod buf_reader;
 mod client_proxy_chain;
 mod client_proxy_selector;
+mod congestion_control;
 mod copy_bidirectional;
 mod copy_bidirectional_message;
 mod crypto;
@@ -106,7 +107,11 @@ mod xudp;
 /// Configuration types.
 pub mod config;
 
+/// Multi-output logging infrastructure.
+pub mod logging;
+
 /// TUN device support for VPN mode.
+#[cfg(unix)]
 pub mod tun;
 
 /// FFI bindings for mobile platforms.

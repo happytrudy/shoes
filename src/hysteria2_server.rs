@@ -8,7 +8,6 @@ use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
 use log::{debug, error, warn};
-use quinn::congestion::{Bbr, BbrConfig, Controller, ControllerFactory};
 use rand::distr::Alphanumeric;
 use rand::{Rng, RngCore};
 use rustc_hash::FxHashMap;
@@ -40,16 +39,6 @@ use crate::stream_reader::StreamReader;
 use crate::tcp::tcp_server::setup_client_tcp_stream;
 use crate::util::allocate_vec;
 
-struct BbrFactory {
-    config: Arc<BbrConfig>,
-}
-
-impl ControllerFactory for BbrFactory {
-    fn new_controller(&self, transport_config: &quinn::TransportConfig) -> Box<dyn Controller> {
-        Box::new(Bbr::new(self.config.clone(), transport_config.initial_mtu))
-    }
-}
-
 async fn process_connection(
     client_proxy_selector: Arc<ClientProxySelector>,
     resolver: Arc<dyn Resolver>,
@@ -74,7 +63,7 @@ async fn process_connection(
     let mut h3_conn: h3::server::Connection<h3_quinn::Connection, bytes::Bytes> =
         h3::server::Connection::new(h3_quinn_connection)
             .await
-            .map_err(std::io::Error::other)?;
+            .map_err(|e| std::io::Error::other(format!("H3 connection setup failed: {e}")))?;
 
     // Per sing-box reference, authentication timeout is 3 seconds
     match timeout(
@@ -180,7 +169,9 @@ fn validate_auth_request<T>(req: http::Request<T>, password: &str) -> std::io::R
             return Err(std::io::Error::other("missing auth header"));
         }
     };
-    let auth_str = auth_value.to_str().map_err(std::io::Error::other)?;
+    let auth_str = auth_value
+        .to_str()
+        .map_err(|e| std::io::Error::other(format!("invalid auth header value: {e}")))?;
     if auth_str != password {
         return Err(std::io::Error::other(format!(
             "incorrect auth password: {auth_str}"
@@ -205,7 +196,11 @@ async fn auth_connection(
     udp_enabled: bool,
 ) -> std::io::Result<()> {
     loop {
-        match h3_conn.accept().await.map_err(std::io::Error::other)? {
+        match h3_conn
+            .accept()
+            .await
+            .map_err(|e| std::io::Error::other(format!("H3 accept failed: {e}")))?
+        {
             Some(resolver) => {
                 let (req, mut stream) = resolver.resolve_request().await.map_err(|err| {
                     std::io::Error::other(format!("Failed to resolve request: {err}"))
@@ -220,12 +215,13 @@ async fn auth_connection(
                             .body(())
                             .unwrap();
 
-                        stream
-                            .send_response(resp)
-                            .await
-                            .map_err(std::io::Error::other)?;
+                        stream.send_response(resp).await.map_err(|e| {
+                            std::io::Error::other(format!("failed to send auth response: {e}"))
+                        })?;
 
-                        stream.finish().await.map_err(std::io::Error::other)?;
+                        stream.finish().await.map_err(|e| {
+                            std::io::Error::other(format!("failed to finish auth stream: {e}"))
+                        })?;
 
                         return Ok(());
                     }
@@ -235,11 +231,12 @@ async fn auth_connection(
                             .status(http::status::StatusCode::NOT_FOUND)
                             .body(())
                             .unwrap();
-                        stream
-                            .send_response(resp)
-                            .await
-                            .map_err(std::io::Error::other)?;
-                        stream.finish().await.map_err(std::io::Error::other)?;
+                        stream.send_response(resp).await.map_err(|e| {
+                            std::io::Error::other(format!("failed to send reject response: {e}"))
+                        })?;
+                        stream.finish().await.map_err(|e| {
+                            std::io::Error::other(format!("failed to finish reject stream: {e}"))
+                        })?;
                     }
                 }
             }
@@ -793,7 +790,8 @@ async fn handle_tcp_header(
         return Err(std::io::Error::other("invalid address length"));
     }
     let address_bytes = stream_reader.read_slice(recv, address_len as usize).await?;
-    let address = std::str::from_utf8(address_bytes).map_err(std::io::Error::other)?;
+    let address = std::str::from_utf8(address_bytes)
+        .map_err(|e| std::io::Error::other(format!("invalid address encoding: {e}")))?;
     let remote_location = NetLocation::from_str(address, None)?;
 
     let padding_len = read_varint(recv, &mut stream_reader).await?;
@@ -830,7 +828,7 @@ async fn handle_tcp_header(
         let count = send
             .write(&response_bytes[i..len])
             .await
-            .map_err(std::io::Error::other)?;
+            .map_err(|e| std::io::Error::other(format!("H3 stream write failed: {e}")))?;
         i += count;
     }
 
@@ -896,7 +894,7 @@ async fn process_tcp_stream(
             let count = client_stream
                 .write(&unparsed_data[i..len])
                 .await
-                .map_err(std::io::Error::other)?;
+                .map_err(|e| std::io::Error::other(format!("H3 stream write failed: {e}")))?;
             i += count;
         }
         true
@@ -981,15 +979,30 @@ pub async fn start_hysteria2_server(
     resolver: Arc<dyn Resolver>,
     num_endpoints: usize,
     udp_enabled: bool,
+    congestion_control: crate::config::CongestionControl,
 ) -> std::io::Result<Vec<JoinHandle<()>>> {
     let mut join_handles = vec![];
     for _ in 0..num_endpoints {
         let quic_server_config = quic_server_config.clone();
         let resolver = resolver.clone();
         let client_proxy_selector = client_proxy_selector.clone();
+        let congestion_control = congestion_control.clone();
 
         let join_handle = tokio::spawn(async move {
             let mut server_config = quinn::ServerConfig::with_crypto(quic_server_config);
+
+            // Apply Brutal congestion controller if configured
+            if let crate::config::CongestionControl::Brutal(ref brutal_cfg) = congestion_control {
+                let bps = crate::congestion_control::parse_bandwidth_bps(&brutal_cfg.bandwidth)
+                    .expect("failed to parse brutal bandwidth");
+                let brutal_config = crate::congestion_control::BrutalConfig::new(bps)
+                    .with_cwnd_gain(brutal_cfg.cwnd_gain)
+                    .with_min_window(brutal_cfg.min_window)
+                    .with_ack_compensate(brutal_cfg.ack_compensate);
+                Arc::get_mut(&mut server_config.transport)
+                    .expect("failed to get mut ref to transport config")
+                    .congestion_controller_factory(std::sync::Arc::new(brutal_config));
+            }
 
             // values estimated from https://github.com/apernet/hysteria/blob/5520bcc405ee11a47c164c75bae5c40fc2b1d99d/core/server/config.go#L16
             Arc::get_mut(&mut server_config.transport)
@@ -1010,8 +1023,7 @@ pub async fn start_hysteria2_server(
                 // Enable GSO (Generic Segmentation Offload) for better throughput
                 .enable_segmentation_offload(true)
                 // Lower initial RTT estimate for faster initial window growth
-                .initial_rtt(Duration::from_millis(100))
-                .congestion_controller_factory(Arc::new(BbrFactory { config: Arc::new(BbrConfig::default()) }));
+                .initial_rtt(Duration::from_millis(100));
 
             // Use 7.5MB socket buffers for high-throughput QUIC (8.625MB on BSD for 15% kernel overhead)
             // https://github.com/quic-go/quic-go/wiki/UDP-Buffer-Sizes
